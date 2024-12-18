@@ -23,8 +23,8 @@ namespace JCMTBV100FSH
                 DataBits = 8,
                 StopBits = StopBits.One,
                 Parity = Parity.None,
-                ReadTimeout = 1000,
-                WriteTimeout = 1000
+                ReadTimeout = 2000,
+                WriteTimeout = 2000
             };
         }
 
@@ -32,115 +32,160 @@ namespace JCMTBV100FSH
         {
             try
             {
-                if (!_serialPort.IsOpen)
+                // Verificar si el puerto existe
+                if (Array.IndexOf(SerialPort.GetPortNames(), _serialPort.PortName) == -1)
                 {
-                    _serialPort.Open();
-                    _serialPort.DataReceived += SerialPort_DataReceived;
+                    OnError?.Invoke(this, $"El puerto {_serialPort.PortName} no está disponible.");
+                    return false;
                 }
 
-                // Secuencia de inicialización
+                // Intentar cerrar el puerto si está abierto
+                try
+                {
+                    if (_serialPort.IsOpen)
+                    {
+                        _serialPort.Close();
+                        await Task.Delay(500); // Esperar a que se libere el puerto
+                    }
+                }
+                catch
+                {
+                    // Ignorar errores al cerrar
+                }
+
+                // Intentar abrir el puerto con reintentos
+                for (int i = 0; i < 3; i++)
+                {
+                    try
+                    {
+                        _serialPort.Open();
+                        _serialPort.DataReceived += SerialPort_DataReceived;
+                        break;
+                    }
+                    catch (UnauthorizedAccessException) when (i < 2)
+                    {
+                        await Task.Delay(1000); // Esperar antes de reintentar
+                        continue;
+                    }
+                }
+
+                if (!_serialPort.IsOpen)
+                {
+                    OnError?.Invoke(this, "No se pudo abrir el puerto después de varios intentos.");
+                    return false;
+                }
+
                 if (!_isInitialized)
                 {
-                    // 1. Reset el dispositivo
-                    if (!await SendCommand(JcmCommands.BuildCommand(JcmCommands.RESET)))
+                    // Secuencia de inicialización
+                    if (!await Reset())
                     {
-                        OnError?.Invoke(this, "Error en Reset inicial");
+                        OnError?.Invoke(this, "Error durante la inicialización.");
                         return false;
                     }
-                    await Task.Delay(2000); // Esperar a que el reset se complete
-
-                    // 2. Configurar nivel de seguridad (medio)
-                    if (!await SendCommand(JcmCommands.SetSecurityLevel(1)))
-                    {
-                        OnError?.Invoke(this, "Error configurando nivel de seguridad");
-                        return false;
-                    }
-
-                    // 3. Configurar dirección de inserción
-                    if (!await SendCommand(JcmCommands.SetDirection(true, true)))
-                    {
-                        OnError?.Invoke(this, "Error configurando dirección");
-                        return false;
-                    }
-
-                    // 4. Habilitar todos los billetes
-                    if (!await SendCommand(JcmCommands.EnableAllBills()))
-                    {
-                        OnError?.Invoke(this, "Error habilitando billetes");
-                        return false;
-                    }
-
                     _isInitialized = true;
                 }
 
+                OnStatusChanged?.Invoke(this, "Conectado correctamente.");
                 return true;
+            }
+            catch (UnauthorizedAccessException)
+            {
+                OnError?.Invoke(this, "Acceso denegado al puerto. Asegúrese de que ninguna otra aplicación lo esté usando.");
+            }
+            catch (IOException ex)
+            {
+                OnError?.Invoke(this, $"Error de E/S: {ex.Message}");
             }
             catch (Exception ex)
             {
                 OnError?.Invoke(this, $"Error al conectar: {ex.Message}");
-                return false;
             }
+            return false;
         }
 
         public void Disconnect()
         {
             if (_serialPort?.IsOpen == true)
             {
+                _serialPort.DataReceived -= SerialPort_DataReceived;
                 _serialPort.Close();
             }
             _isInitialized = false;
+            OnStatusChanged?.Invoke(this, "Desconectado.");
         }
 
         public async Task<bool> Reset()
         {
-            _isInitialized = false;
-            return await Connect(); // Esto ejecutará toda la secuencia de inicialización
+            try
+            {
+                _isInitialized = false;
+                return await SendCommand(JcmCommands.BuildCommand(JcmCommands.RESET));
+            }
+            catch (Exception ex)
+            {
+                OnError?.Invoke(this, $"Error al realizar Reset: {ex.Message}");
+                return false;
+            }
         }
 
         public async Task<bool> Enable()
         {
-            if (!_isInitialized)
+            try
             {
-                if (!await Connect())
+                // 1. Enviar comando de reset primero
+                if (!await Reset())
                 {
+                    OnError?.Invoke(this, "Error en el reset inicial");
                     return false;
                 }
+
+                // 2. Esperar un momento para que el dispositivo se estabilice
+                await Task.Delay(1000);
+
+                // 3. Habilitar todos los canales de billetes
+                if (!await SendCommand(JcmCommands.EnableAllBills()))
+                {
+                    OnError?.Invoke(this, "Error al habilitar canales de billetes");
+                    return false;
+                }
+
+                // 4. Configurar la dirección del billete (face up y front first)
+                if (!await SendCommand(JcmCommands.SetDirection(true, true)))
+                {
+                    OnError?.Invoke(this, "Error al configurar dirección del billete");
+                    return false;
+                }
+
+                // 5. Finalmente enviar el comando enable
+                if (!await SendCommand(JcmCommands.BuildCommand(JcmCommands.ENABLE)))
+                {
+                    OnError?.Invoke(this, "Error al habilitar el validador");
+                    return false;
+                }
+
+                return true;
             }
-            return await SendCommand(JcmCommands.BuildCommand(JcmCommands.ENABLE));
+            catch (Exception ex)
+            {
+                OnError?.Invoke(this, $"Error en la secuencia de habilitación: {ex.Message}");
+                return false;
+            }
         }
 
-        public async Task<bool> Disable()
-        {
-            return await SendCommand(JcmCommands.BuildCommand(JcmCommands.DISABLE));
-        }
-
-        public async Task<bool> Stack()
-        {
-            return await SendCommand(JcmCommands.BuildCommand(JcmCommands.STACK));
-        }
-
-        public async Task<bool> Return()
-        {
-            return await SendCommand(JcmCommands.BuildCommand(JcmCommands.RETURN));
-        }
+        public async Task<bool> Disable() => await SendCommand(JcmCommands.BuildCommand(JcmCommands.DISABLE));
+        public async Task<bool> Stack() => await SendCommand(JcmCommands.BuildCommand(JcmCommands.STACK));
+        public async Task<bool> Return() => await SendCommand(JcmCommands.BuildCommand(JcmCommands.RETURN));
 
         private async Task<bool> SendCommand(byte[] command)
         {
             try
             {
                 if (!_serialPort.IsOpen)
-                {
-                    throw new InvalidOperationException("Puerto serial no está abierto");
-                }
+                    throw new InvalidOperationException("El puerto serial no está abierto.");
 
                 await Task.Run(() => _serialPort.Write(command, 0, command.Length));
-
-                // Esperar respuesta
-                byte[] response = new byte[5];
-                await Task.Run(() => _serialPort.Read(response, 0, 5));
-
-                // Verificar ACK
-                return response[2] == JcmCommands.ACK;
+                return true;
             }
             catch (Exception ex)
             {
@@ -157,7 +202,6 @@ namespace JCMTBV100FSH
 
                 byte[] buffer = new byte[_serialPort.BytesToRead];
                 _serialPort.Read(buffer, 0, buffer.Length);
-
                 ProcessResponse(buffer);
             }
             catch (Exception ex)
@@ -168,62 +212,38 @@ namespace JCMTBV100FSH
 
         private void ProcessResponse(byte[] response)
         {
-            if (response.Length >= 5 && response[0] == JcmCommands.STX)
+            if (response.Length < 5 || response[0] != JcmCommands.STX)
             {
-                byte command = response[2];
-                switch (command)
-                {
-                    case 0x71: // Billete insertado y en posición
-                        OnStatusChanged?.Invoke(this, "Billete en posición");
-                        break;
-                    case 0x72: // Billete aceptado
-                        byte channel = response[3];
-                        decimal value = GetBillValue(channel);
-                        OnBillAccepted?.Invoke(this, value);
-                        break;
-                    case 0x73: // Billete rechazado
-                        OnStatusChanged?.Invoke(this, "Billete rechazado");
-                        break;
-                    case 0x31: // Status
-                        ProcessStatusResponse(response);
-                        break;
-                }
+                OnError?.Invoke(this, "Respuesta inválida recibida.");
+                return;
             }
-        }
 
-        private void ProcessStatusResponse(byte[] response)
-        {
-            if (response.Length < 6) return;
-
-            byte status = response[3];
-            string statusMessage = "Estado: ";
-
-            if ((status & 0x01) != 0) statusMessage += "Ocupado, ";
-            if ((status & 0x02) != 0) statusMessage += "Billete en validador, ";
-            if ((status & 0x04) != 0) statusMessage += "Error de checksum, ";
-            if ((status & 0x08) != 0) statusMessage += "Validador lleno, ";
-            if ((status & 0x10) != 0) statusMessage += "Billete atascado, ";
-            if ((status & 0x20) != 0) statusMessage += "Error de cassette, ";
-            if ((status & 0x40) != 0) statusMessage += "Error de validador, ";
-            if ((status & 0x80) != 0) statusMessage += "Error de comunicación, ";
-
-            OnStatusChanged?.Invoke(this, statusMessage.TrimEnd(' ', ','));
+            byte command = response[2];
+            switch (command)
+            {
+                case 0x72: // Billete aceptado
+                    decimal value = GetBillValue(response[3]);
+                    OnBillAccepted?.Invoke(this, value);
+                    break;
+                default:
+                    OnStatusChanged?.Invoke(this, $"Comando recibido: {command:X2}");
+                    break;
+            }
         }
 
         private decimal GetBillValue(byte channel)
         {
-            // Esto debería configurarse según los valores reales de los billetes
-            switch (channel)
+            return channel switch
             {
-                case 1: return 1000.00M; // $1000
-                case 2: return 2000.00M; // $2000
-                case 3: return 5000.00M; // $5000
-                case 4: return 10000.00M; // $10000
-                case 5: return 20000.00M; // $20000
-                case 6: return 50000.00M; // $50000
-                case 7: return 100000.00M; // $100000
-                default: return 0.00M;
-            }
+                1 => 1000.00M,
+                2 => 2000.00M,
+                3 => 5000.00M,
+                4 => 10000.00M,
+                5 => 20000.00M,
+                6 => 50000.00M,
+                7 => 100000.00M,
+                _ => 0.00M,
+            };
         }
 
         public void Dispose()

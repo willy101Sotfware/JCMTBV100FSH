@@ -8,10 +8,11 @@ namespace JCMTBV100FSH
     {
         private SerialPort _serialPort;
         private bool _isDisposed;
+        private bool _isInitialized;
 
-        public event EventHandler<string> OnStatusChanged;
-        public event EventHandler<decimal> OnBillAccepted;
-        public event EventHandler<string> OnError;
+        public event EventHandler<string>? OnStatusChanged;
+        public event EventHandler<decimal>? OnBillAccepted;
+        public event EventHandler<string>? OnError;
 
         public JcmBillValidator(string portName, int baudRate = 9600)
         {
@@ -27,7 +28,7 @@ namespace JCMTBV100FSH
             };
         }
 
-        public bool Connect()
+        public async Task<bool> Connect()
         {
             try
             {
@@ -36,6 +37,42 @@ namespace JCMTBV100FSH
                     _serialPort.Open();
                     _serialPort.DataReceived += SerialPort_DataReceived;
                 }
+
+                // Secuencia de inicialización
+                if (!_isInitialized)
+                {
+                    // 1. Reset el dispositivo
+                    if (!await SendCommand(JcmCommands.BuildCommand(JcmCommands.RESET)))
+                    {
+                        OnError?.Invoke(this, "Error en Reset inicial");
+                        return false;
+                    }
+                    await Task.Delay(2000); // Esperar a que el reset se complete
+
+                    // 2. Configurar nivel de seguridad (medio)
+                    if (!await SendCommand(JcmCommands.SetSecurityLevel(1)))
+                    {
+                        OnError?.Invoke(this, "Error configurando nivel de seguridad");
+                        return false;
+                    }
+
+                    // 3. Configurar dirección de inserción
+                    if (!await SendCommand(JcmCommands.SetDirection(true, true)))
+                    {
+                        OnError?.Invoke(this, "Error configurando dirección");
+                        return false;
+                    }
+
+                    // 4. Habilitar todos los billetes
+                    if (!await SendCommand(JcmCommands.EnableAllBills()))
+                    {
+                        OnError?.Invoke(this, "Error habilitando billetes");
+                        return false;
+                    }
+
+                    _isInitialized = true;
+                }
+
                 return true;
             }
             catch (Exception ex)
@@ -51,34 +88,43 @@ namespace JCMTBV100FSH
             {
                 _serialPort.Close();
             }
+            _isInitialized = false;
         }
 
         public async Task<bool> Reset()
         {
-            return await SendCommand(JcmCommands.RESET);
+            _isInitialized = false;
+            return await Connect(); // Esto ejecutará toda la secuencia de inicialización
         }
 
         public async Task<bool> Enable()
         {
-            return await SendCommand(JcmCommands.ENABLE);
+            if (!_isInitialized)
+            {
+                if (!await Connect())
+                {
+                    return false;
+                }
+            }
+            return await SendCommand(JcmCommands.BuildCommand(JcmCommands.ENABLE));
         }
 
         public async Task<bool> Disable()
         {
-            return await SendCommand(JcmCommands.DISABLE);
+            return await SendCommand(JcmCommands.BuildCommand(JcmCommands.DISABLE));
         }
 
         public async Task<bool> Stack()
         {
-            return await SendCommand(JcmCommands.STACK);
+            return await SendCommand(JcmCommands.BuildCommand(JcmCommands.STACK));
         }
 
         public async Task<bool> Return()
         {
-            return await SendCommand(JcmCommands.RETURN);
+            return await SendCommand(JcmCommands.BuildCommand(JcmCommands.RETURN));
         }
 
-        private async Task<bool> SendCommand(byte command)
+        private async Task<bool> SendCommand(byte[] command)
         {
             try
             {
@@ -87,9 +133,14 @@ namespace JCMTBV100FSH
                     throw new InvalidOperationException("Puerto serial no está abierto");
                 }
 
-                byte[] cmd = JcmCommands.BuildCommand(command);
-                await Task.Run(() => _serialPort.Write(cmd, 0, cmd.Length));
-                return true;
+                await Task.Run(() => _serialPort.Write(command, 0, command.Length));
+
+                // Esperar respuesta
+                byte[] response = new byte[5];
+                await Task.Run(() => _serialPort.Read(response, 0, 5));
+
+                // Verificar ACK
+                return response[2] == JcmCommands.ACK;
             }
             catch (Exception ex)
             {
@@ -117,20 +168,61 @@ namespace JCMTBV100FSH
 
         private void ProcessResponse(byte[] response)
         {
-            // Implementar el procesamiento de respuesta según la documentación del JBV-100-FSH
-            // Este es un ejemplo básico
             if (response.Length >= 5 && response[0] == JcmCommands.STX)
             {
                 byte command = response[2];
                 switch (command)
                 {
-                    case 0x71: // Ejemplo: Billete aceptado
-                        OnBillAccepted?.Invoke(this, 100.00M); // El valor dependerá del billete
+                    case 0x71: // Billete insertado y en posición
+                        OnStatusChanged?.Invoke(this, "Billete en posición");
+                        break;
+                    case 0x72: // Billete aceptado
+                        byte channel = response[3];
+                        decimal value = GetBillValue(channel);
+                        OnBillAccepted?.Invoke(this, value);
+                        break;
+                    case 0x73: // Billete rechazado
+                        OnStatusChanged?.Invoke(this, "Billete rechazado");
                         break;
                     case 0x31: // Status
-                        OnStatusChanged?.Invoke(this, "Status recibido");
+                        ProcessStatusResponse(response);
                         break;
                 }
+            }
+        }
+
+        private void ProcessStatusResponse(byte[] response)
+        {
+            if (response.Length < 6) return;
+
+            byte status = response[3];
+            string statusMessage = "Estado: ";
+
+            if ((status & 0x01) != 0) statusMessage += "Ocupado, ";
+            if ((status & 0x02) != 0) statusMessage += "Billete en validador, ";
+            if ((status & 0x04) != 0) statusMessage += "Error de checksum, ";
+            if ((status & 0x08) != 0) statusMessage += "Validador lleno, ";
+            if ((status & 0x10) != 0) statusMessage += "Billete atascado, ";
+            if ((status & 0x20) != 0) statusMessage += "Error de cassette, ";
+            if ((status & 0x40) != 0) statusMessage += "Error de validador, ";
+            if ((status & 0x80) != 0) statusMessage += "Error de comunicación, ";
+
+            OnStatusChanged?.Invoke(this, statusMessage.TrimEnd(' ', ','));
+        }
+
+        private decimal GetBillValue(byte channel)
+        {
+            // Esto debería configurarse según los valores reales de los billetes
+            switch (channel)
+            {
+                case 1: return 1000.00M; // $1000
+                case 2: return 2000.00M; // $2000
+                case 3: return 5000.00M; // $5000
+                case 4: return 10000.00M; // $10000
+                case 5: return 20000.00M; // $20000
+                case 6: return 50000.00M; // $50000
+                case 7: return 100000.00M; // $100000
+                default: return 0.00M;
             }
         }
 

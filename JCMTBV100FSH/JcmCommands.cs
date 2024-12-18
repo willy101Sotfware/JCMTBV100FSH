@@ -13,10 +13,19 @@ namespace JCMTBV100FSH
         public static readonly byte RETURN = 0x36;
         public static readonly byte HOLD = 0x38;
 
+        // Comandos de configuración
+        public static readonly byte SET_SECURITY = 0x32;
+        public static readonly byte SET_INHIBITS = 0x34;
+        public static readonly byte SET_DIRECTION = 0x3C;
+        public static readonly byte SET_OPTIONAL_FUNCTION = 0x37;
+        public static readonly byte GET_VERSION = 0x33;
+
         // Bytes de control
         public static readonly byte STX = 0x02;
         public static readonly byte ETX = 0x03;
         public static readonly byte DLE = 0x10;
+        public static readonly byte ACK = 0x06;
+        public static readonly byte NAK = 0x15;
 
         // Métodos para construir comandos
         public static byte[] BuildCommand(byte command)
@@ -28,6 +37,43 @@ namespace JCMTBV100FSH
             cmd[3] = ETX;
             cmd[4] = CalculateChecksum(cmd, 1, 3);
             return cmd;
+        }
+
+        public static byte[] BuildCommandWithData(byte command, byte[] data)
+        {
+            byte[] cmd = new byte[5 + data.Length];
+            cmd[0] = STX;
+            cmd[1] = 0x00; // Dirección por defecto
+            cmd[2] = command;
+            Array.Copy(data, 0, cmd, 3, data.Length);
+            cmd[3 + data.Length] = ETX;
+            cmd[4 + data.Length] = CalculateChecksum(cmd, 1, 3 + data.Length);
+            return cmd;
+        }
+
+        // Comandos específicos de configuración
+        public static byte[] EnableAllBills()
+        {
+            // Habilita todos los billetes (16 canales)
+            byte[] data = new byte[8];
+            for (int i = 0; i < 8; i++)
+            {
+                data[i] = 0xFF; // Todos los bits en 1 para habilitar
+            }
+            return BuildCommandWithData(SET_INHIBITS, data);
+        }
+
+        public static byte[] SetSecurityLevel(byte level)
+        {
+            return BuildCommandWithData(SET_SECURITY, new byte[] { level });
+        }
+
+        public static byte[] SetDirection(bool faceUp, bool frontFirst)
+        {
+            byte direction = 0x00;
+            if (faceUp) direction |= 0x01;
+            if (frontFirst) direction |= 0x02;
+            return BuildCommandWithData(SET_DIRECTION, new byte[] { direction });
         }
 
         private static byte CalculateChecksum(byte[] data, int start, int length)

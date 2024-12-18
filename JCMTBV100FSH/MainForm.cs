@@ -20,7 +20,7 @@ namespace JCMTBV100FSH
                 cmbPorts.SelectedIndex = 0;
         }
 
-        private void btnConnect_Click(object sender, EventArgs e)
+        private async void btnConnect_Click(object sender, EventArgs e)
         {
             if (!_isConnected)
             {
@@ -35,7 +35,7 @@ namespace JCMTBV100FSH
                 _validator.OnBillAccepted += Validator_OnBillAccepted;
                 _validator.OnError += Validator_OnError;
 
-                if (_validator.Connect())
+                if (await _validator.Connect())
                 {
                     _isConnected = true;
                     btnConnect.Text = "Desconectar";
